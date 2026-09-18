@@ -4,7 +4,7 @@ import logging
 from functools import lru_cache
 
 from ..config import Settings, get_settings
-from .providers.base import LLMProvider, TranscriptionProvider
+from .providers.base import LLMProvider, ProviderError, TranscriptionProvider
 
 log = logging.getLogger(__name__)
 
@@ -50,13 +50,11 @@ class AIGateway:
                 timeout=self._settings.gemini_timeout,
             )
 
-        from .providers.whisper_local import FasterWhisperProvider
-        return FasterWhisperProvider(
-            model_size=self._settings.whisper_model,
-            device=self._settings.whisper_device,
-            compute_type=self._settings.whisper_compute_type,
-            vad_filter=self._settings.whisper_vad_filter,
-        )
+        # Local Whisper runs in the agent container, not here. The API only ever
+        # needs this to report configuration on /health.
+        raise ProviderError(
+            "faster_whisper runs in the agent service, not the API. "
+            "This container does not transcribe.")
 
     def _build_llm(self) -> LLMProvider:
         choice = self._settings.llm_provider

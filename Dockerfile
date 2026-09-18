@@ -1,29 +1,21 @@
 # ---------------------------------------------------------------------------
-# Multi-stage. Two runnable targets, so the same repo can be deployed twice as
-# separate Dokploy applications:
+# The API. Single stage, one job — Dokploy builds this repo and gets the HTTP
+# server, no Build Stage field required.
 #
-#   target: api      the HTTP API          (Build Stage: api)
-#   target: worker   transcription + LLM   (Build Stage: worker)
-#
-# Leaving Dokploy's "Build Stage" empty builds the last stage, which is `api`.
-#
-# The split is not cosmetic: the worker needs faster-whisper and ctranslate2,
-# several hundred megabytes the API never touches. Building them separately keeps
-# the API image small and its deploys fast.
+# Transcription and meeting analysis live in the companion repo (kanban-agent),
+# which runs as its own container against the same database and object store.
 # ---------------------------------------------------------------------------
-
-FROM python:3.12-slim AS base
+FROM python:3.12-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/srv/src \
-    # Whisper weights cache here. Mount a volume on this path so they survive
-    # a redeploy instead of being downloaded again.
-    HF_HOME=/var/lib/workconsole/models
+    PYTHONPATH=/srv/src
 
 WORKDIR /srv
 
+# curl is for the healthcheck. No ffmpeg here — the API never touches audio
+# beyond streaming it into object storage.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
@@ -36,35 +28,14 @@ COPY alembic.ini ./
 COPY migrations ./migrations
 
 RUN useradd --create-home --uid 10001 workconsole \
-    && mkdir -p /var/lib/workconsole/objects /var/lib/workconsole/models \
+    && mkdir -p /var/lib/workconsole/objects \
     && chown -R workconsole:workconsole /var/lib/workconsole /srv
-
-
-# --- worker ----------------------------------------------------------------
-# Transcription and analysis. No HTTP server, so no port and no healthcheck —
-# Dokploy should not expect either.
-FROM base AS worker
-
-# ffmpeg decodes the uploaded m4a; faster-whisper shells out to it.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install ".[whisper]"
-
-USER workconsole
-CMD ["python", "-m", "app.workers.runner"]
-
-
-# --- api -------------------------------------------------------------------
-# Last stage on purpose: an empty "Build Stage" in Dokploy lands here.
-FROM base AS api
 
 USER workconsole
 EXPOSE 8080
 
-# /health returns 503 when Postgres is unreachable, so this genuinely reflects
-# whether the service can do its job.
+# /health returns 503 when Postgres is unreachable, so this reflects whether the
+# service can actually do its job.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 

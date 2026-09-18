@@ -1,7 +1,7 @@
 [project]
-name = "workconsole-backend"
+name = "workconsole-api"
 version = "1.0.0"
-description = "Self-hosted API, job queue and local AI workers for the macOS work console"
+description = "HTTP API for the macOS work console"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -19,8 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Installed on the VPS, where the models actually run.
-whisper = ["faster-whisper>=1.1.0"]
 # Optional cloud provider. Off unless explicitly selected; nothing uses it by default.
 gemini = ["langchain-google-genai>=2.0.8"]
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "httpx>=0.28"]
