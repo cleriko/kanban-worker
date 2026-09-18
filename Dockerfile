@@ -22,7 +22,7 @@ RUN apt-get update \
 
 COPY pyproject.toml ./
 COPY src ./src
-RUN pip install .
+RUN pip install ".[gemini]"
 
 COPY alembic.ini ./
 COPY migrations ./migrations
