@@ -1,15 +1,20 @@
-# Deploying on Dokploy
+# Deploying the API on Dokploy
 
-## The three services
+This repo is one half of the deployable split: it builds the HTTP API and nothing
+else. Transcription and analysis live in
+[kanban-agent](https://github.com/cleriko/kanban-agent), which runs against the
+same Postgres and the same object-storage volume. The combined reference
+implementation is `kanban-backend`.
 
-| # | Dokploy type | Build Stage | Domain |
+## The two services
+
+| # | Dokploy type | Build | Domain |
 |---|---|---|---|
 | 1 | Database → PostgreSQL | — | none |
-| 2 | Application → this repo | `api` | yes, → port **8080** |
-| 3 | Application → this repo | `worker` | **none** |
+| 2 | Application → this repo | Dockerfile | yes, → port **8080** |
 
-Same repo deployed twice. The `Dockerfile` is multi-stage; the **Build Stage**
-field picks which process you get. There is no Ollama — the LLM is the Gemini API.
+If you already run the API from another repo, skip to the agent — do not create a
+second Postgres.
 
 ---
 
@@ -18,15 +23,18 @@ field picks which process you get. There is no Ollama — the LLM is the Gemini 
 Dokploy → Create → **Database** → PostgreSQL. Any user/password/database name.
 
 When it is running, open it and copy the **internal** host — something like
-`workconsole-db-a1b2c3`. That is what the other two services connect to. It is
+`workconsole-db-a1b2c3`. That is what the API and the agent connect to. It is
 *not* `localhost`, and it is not the external host.
+
+If you launch a Compose stack that creates Postgres instead,
+`POSTGRES_PASSWORD` is required. There is no built-in default.
 
 ## 2. API
 
 Create → **Application** → this repo, branch `main`.
 
-- Build Type: **Dockerfile**
-- Build Stage: **`api`**
+- Build Type: **Dockerfile**. No Build Stage — the Dockerfile is single-stage and
+  builds the API only.
 - Domain: your hostname → port **8080**
 - Volume: `/var/lib/workconsole/objects` → `/var/lib/workconsole/objects`
 
@@ -38,36 +46,30 @@ WC_API_TOKEN=generate-with-openssl-rand-hex-24
 WC_GEMINI_API_KEY=your-google-ai-studio-key
 WC_LLM_PROVIDER=gemini
 WC_GEMINI_MODEL=gemini-2.5-flash
-WC_TRANSCRIPTION_PROVIDER=faster_whisper
-WC_WHISPER_MODEL=base.en
-WC_WHISPER_COMPUTE_TYPE=int8
 WC_STORAGE_BACKEND=local
 WC_STORAGE_PATH=/var/lib/workconsole/objects
 WC_RUN_MIGRATIONS=true
 WC_LOG_LEVEL=info
 ```
 
-## 3. Worker
+`WC_API_TOKEN` is required. With it unset, every authenticated route returns
+**503** — auth fails closed rather than serving requests. A wrong token returns
+**401**. `WC_ALLOW_UNAUTHENTICATED=1` is an explicit opt-out for a private tunnel
+or local tests only; never set it on a host with a public domain.
 
-Create a **second Application** from the same repo.
+Audio uploads (`PUT /meetings/{id}/audio`) must be a recognised container —
+m4a/mp4, wav, mp3, ogg or webm — with matching leading bytes. Anything else is
+**400**; the cap is 512 MB.
 
-- Build Stage: **`worker`**
-- **No domain and no port.** It serves no HTTP; a domain would healthcheck
-  forever and never pass.
-- Volumes:
-  - `/var/lib/workconsole/objects` → `/var/lib/workconsole/objects`
-    — **the same host path as the API**
-  - `/var/lib/workconsole/models` → `/var/lib/workconsole/models`
-    — Whisper weights, so they survive redeploys
+## 3. Agent
 
-Environment: identical to the API, except:
+Create a second Dokploy Application from
+[kanban-agent](https://github.com/cleriko/kanban-agent). It serves no HTTP, so it
+gets **no domain and no port**. Mount the same object-storage host path, plus a
+volume for Whisper weights. Full walkthrough in that repo's `DEPLOY.md`.
 
-```env
-WC_RUN_MIGRATIONS=false
-```
-
-Both need `WC_GEMINI_API_KEY`: the API runs the agent, the worker runs meeting
-analysis.
+Both services need `WC_GEMINI_API_KEY`: the API runs the agent, the worker runs
+meeting analysis. Only the API sets `WC_RUN_MIGRATIONS=true`.
 
 ---
 
@@ -75,7 +77,7 @@ analysis.
 
 If the startup log shows `db=localhost:5432` **and** `WC_API_TOKEN is empty`
 **and** `WC_GEMINI_API_KEY is empty` all at once, none of them are reaching the
-container. That is one problem, not three. The log now says so directly:
+container. That is one problem, not three. The log says so directly:
 
 ```
 ERROR  No WC_* environment variables are set in this container.
@@ -117,7 +119,7 @@ ERROR  WC_DATABASE_URL is not set. Falling back to localhost ...
 GET /health 503 Service Unavailable
 ```
 
-**3. The shared volume.** The API writes the uploaded audio; the worker reads it.
+**3. The shared volume.** The API writes the uploaded audio; the agent reads it.
 If they are not on the same host path, every job fails with a missing file. (To
 avoid sharing a filesystem, use `WC_STORAGE_BACKEND=s3` instead.)
 
@@ -129,95 +131,48 @@ avoid sharing a filesystem, use `WC_STORAGE_BACKEND=s3` instead.)
 curl https://your-domain/health
 ```
 
-`200` with `"database": true`. A `503` carries a `detail` field saying why.
+`200` with `"database": true`. A `503` carries a `detail` field saying why. The
+`/health` route is unauthenticated on purpose, so it can be probed without a key.
 
 The API log should read `db=<your-pg-host>:5432`.
-
-The worker has no endpoint — read its log. On boot:
-
-```
-worker <host>:<pid> ready · stt=faster_whisper · llm=gemini
-```
 
 Then point the Mac app at it: Settings → VPS → Server URL `https://your-domain`,
 API key = your `WC_API_TOKEN`.
 
 ---
 
-## Alternative: one compose application
-
-If you would rather run it as a single Dokploy **Compose** application, the repo's
-`docker-compose.yml` defines everything and sets the database URL and volumes for
-you. Paste `.env.example` into the Environment tab, set `WC_API_TOKEN`,
-`POSTGRES_PASSWORD` and `WC_GEMINI_API_KEY`, and attach the domain to the `api`
-service on port 8080.
-
-## Models and footprint
-
-| | runs | model | size |
-|---|---|---|---|
-| speech-to-text | **on your VPS** | `base.en` | ~145 MB |
-| LLM | **Gemini API** | `gemini-2.5-flash` | nothing to host |
-
-Nothing else to install. Whole stack:
+## Footprint
 
 | | |
 |---|---|
 | postgres | ~256 MB |
 | api | ~256 MB |
-| worker | ~600 MB while transcribing, near zero idle |
+| agent | ~600 MB while transcribing, near zero idle |
 
-**Around 1 GB.** A 2 GB VPS is fine. The 8 GB figure only applied when an 8B model
-was running locally.
+The agent is a separate container, so the API image carries no ffmpeg and no
+Whisper weights. Total is around 1 GB across the stack; a 2 GB VPS is fine.
 
 ### Where your data goes
 
-- **Meeting audio** — never leaves the VPS. Whisper transcribes it locally, and the
-  file is deleted once results are stored.
+- **Meeting audio** — never leaves the VPS. The agent transcribes it locally with
+  Whisper, and the file is deleted once results are stored.
 - **Transcripts, task titles, meeting notes** — sent to Google as part of analysis
   and agent requests.
 
-If that split is not acceptable, see [Fully local](#fully-local).
-
-### Whisper sizes
-
-| model | size | when |
-|---|---|---|
-| `tiny.en` | ~75 MB | a very small box, clear speech only |
-| `base.en` | ~145 MB | **the default** |
-| `small.en` | ~480 MB | accents, crosstalk, poor microphones |
-| `medium.en` | ~1.5 GB | diminishing returns without a GPU |
-
-With a GPU: `WC_WHISPER_DEVICE=cuda`, `WC_WHISPER_COMPUTE_TYPE=float16`.
-
-### Fully local
-
-No Google at all. Costs memory:
-
-```
-WC_LLM_PROVIDER=ollama
-WC_OLLAMA_URL=http://OLLAMA_HOST:11434
-WC_OLLAMA_MODEL=qwen2.5:0.5b     # ~400 MB, weak agent
-WC_LLM_NUM_CTX=4096
-WC_ANALYSIS_CHUNK_CHARS=6000
-```
-
-Compose: `docker compose --profile local-llm up -d`, then
-`docker compose exec ollama ollama pull qwen2.5:0.5b`. Separate applications: add
-an Ollama application from the `ollama/ollama:latest` image, no domain.
-
-Model sizes: `qwen2.5:0.5b` ~400 MB, `llama3.2:1b` ~810 MB, `qwen2.5:3b` ~1.9 GB,
-`llama3.1:8b` ~4.7 GB. Summaries hold up from 0.5B because decoding is
-schema-constrained; the agent needs 3B+ to be useful.
+If that split is not acceptable, set `WC_LLM_PROVIDER=ollama` and point
+`WC_OLLAMA_URL` at an Ollama service. Model choices and sizes are documented in
+the agent repo's `DEPLOY.md`.
 
 ### Transcribing with Gemini too
 
-Removes Whisper entirely — no weights, no ffmpeg, ~512 MB total — but uploads the
-meeting audio to Google:
+Removes ffmpeg and the Whisper weights from the agent, ~512 MB total for the
+stack, but uploads the meeting audio to Google:
 
 ```
 WC_TRANSCRIPTION_PROVIDER=gemini
 ```
+
+---
 
 ## Troubleshooting
 
@@ -226,19 +181,16 @@ WC_TRANSCRIPTION_PROVIDER=gemini
 **`503` on `/health`** — read the `detail` field. Usually Postgres is still
 starting, or the URL is missing `+asyncpg`.
 
-**Health is fine but meetings never finish processing** — look at the worker. It
-is a separate process and never appears in the API's logs. The usual causes are
+**Health is fine but meetings never finish processing** — look at the agent. It
+is a separate service and never appears in the API's logs. The usual causes are
 the model not being pulled, or the object-storage volume not being shared.
 
 **`WC_GEMINI_API_KEY is empty`** — the API logs this at startup; every analysis
 and agent request will fail until it is set.
 
-**`model '...' is not available`** — only applies to the local-LLM path; run
-`ollama pull` in the Ollama container.
-
-**Worker logs `FileNotFoundError` on an audio key** — the API and worker are not
+**Agent logs `FileNotFoundError` on an audio key** — the API and the agent are not
 sharing `/var/lib/workconsole/objects`.
 
 **The app shows OFFLINE but curl works** — the API key does not match
-`WC_API_TOKEN`. `/health` is unauthenticated, so curl succeeds while everything
-else 401s.
+`WC_API_TOKEN` (401), or `WC_API_TOKEN` is unset on the server (503). `/health` is
+unauthenticated, so curl succeeds while everything else is refused.

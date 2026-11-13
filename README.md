@@ -22,7 +22,7 @@ Environment:
 
 ```env
 WC_DATABASE_URL=postgresql+asyncpg://USER:PASSWORD@PG_HOST:5432/DBNAME
-WC_API_TOKEN=openssl rand -hex 24
+WC_API_TOKEN=generate-with-openssl-rand-hex-24
 WC_GEMINI_API_KEY=your-google-ai-studio-key
 WC_LLM_PROVIDER=gemini
 WC_GEMINI_MODEL=gemini-2.5-flash
@@ -35,6 +35,14 @@ WC_LOG_LEVEL=info
 `WC_RUN_MIGRATIONS=true` here and `false` on the agent, so they do not race to
 migrate. `WC_DATABASE_URL` must use `postgresql+asyncpg://`, and `PG_HOST` is
 Postgres's **internal** Dokploy host — never `localhost`.
+
+`WC_API_TOKEN` is required. With it unset, every authenticated route returns
+**503** — the API fails closed rather than disabling auth. A wrong token returns
+**401**. `WC_ALLOW_UNAUTHENTICATED=1` is an explicit opt-out for a private tunnel
+or local tests only; never set it on a host with a public domain.
+
+Any Compose stack that creates Postgres also needs `POSTGRES_PASSWORD`; there is
+no built-in default.
 
 Paste into **Environment**, not Build-time variables, then **Redeploy**. Saving
 alone does not restart the container.
@@ -59,14 +67,19 @@ Everything under `/api/v1`, bearer-authenticated except `/health`.
 | `POST /tasks/{id}/move`, `/complete`, `/reopen` | transitions |
 | `GET /summary` | counts + agenda |
 | `GET/POST /meetings`, `GET/DELETE /meetings/{id}` | meeting records |
-| `PUT /meetings/{id}/audio` | streams the recording into object storage |
+| `PUT /meetings/{id}/audio` | streams the recording into object storage; m4a/mp4, wav, mp3, ogg and webm only |
 | `POST /meetings/{id}/process` | queues a job for the agent, returns immediately |
 | `GET /meetings/{id}/transcript`, `/action-items` | results |
 | `GET /jobs/{id}`, `GET /jobs/{id}/events` | polling, and SSE progress |
 | `POST /agent/chat` | one agent turn |
 | `POST /agent/actions/{id}/execute` | runs one confirmed operation |
+| `GET /agent/actions` | pending, or `?history=true` for the audit trail |
 
-Docs at `/api/docs`.
+`PUT /meetings/{id}/audio` validates the body: the `Content-Type` must be one of
+the recognised containers above and the first bytes must match. Anything else is
+**400**; uploads are capped at 512 MB.
+
+Docs are off by default; set `WC_ENABLE_DOCS=1` to serve `/api/docs` on a private host.
 
 ## How the agent is kept on a leash
 

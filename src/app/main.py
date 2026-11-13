@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from contextlib import asynccontextmanager
-
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Response, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -62,8 +65,13 @@ async def lifespan(app: FastAPI):
                   "container is the container itself — nothing will work. Set it in the "
                   "environment (compose points it at the 'postgres' service).")
     if not settings.auth_enabled:
-        log.warning("WC_API_TOKEN is empty: the API is unauthenticated. Only acceptable "
-                    "behind a private tunnel.")
+        if settings.allow_unauthenticated:
+            log.warning("WC_API_TOKEN is empty and WC_ALLOW_UNAUTHENTICATED is set: the API "
+                        "is unauthenticated. Only acceptable behind a private tunnel.")
+        else:
+            log.error("WC_API_TOKEN is empty. Every /api/v1 request will be refused until "
+                      "it is set. Put a long random token in the environment and in the "
+                      "Mac app's Settings → VPS → API KEY.")
     if settings.uses_gemini:
         sent = []
         if settings.transcription_provider == "gemini":
@@ -77,10 +85,11 @@ async def lifespan(app: FastAPI):
     await dispose()
 
 
-app = FastAPI(title="Work Console", version=VERSION, lifespan=lifespan,
-              docs_url="/api/docs", openapi_url="/api/openapi.json")
-
 _settings = get_settings()
+app = FastAPI(title="Work Console", version=VERSION, lifespan=lifespan,
+              docs_url="/api/docs" if _settings.enable_docs else None,
+              openapi_url="/api/openapi.json" if _settings.enable_docs else None)
+
 if _settings.cors_origins:
     app.add_middleware(CORSMiddleware, allow_origins=_settings.cors_origins,
                        allow_methods=["*"], allow_headers=["*"])
@@ -115,20 +124,27 @@ async def health(response: Response) -> HealthDTO:
     detail: str | None = None
     try:
         async with session_scope() as session:
-            await session.execute(text("SELECT 1"))
+            # A real table, not SELECT 1: a reachable database with no schema looks
+            # perfectly healthy to a connection-only probe while every route 500s.
+            await session.execute(text("SELECT 1 FROM tasks LIMIT 1"))
         if _health_failures:
             log.info("database reachable again after %d failed checks", _health_failures)
             _health_failures = 0
     except Exception as exc:  # noqa: BLE001
         database_ok = False
-        detail = _connection_hint(settings.database_url, exc)
+        detail = _schema_hint() if _schema_missing(exc) else _connection_hint(
+            settings.database_url, exc)
         if _health_failures == 0:
-            log.error("database unreachable: %s", detail)
+            log.error("database unhealthy: %s", detail)
             log.debug("health check traceback", exc_info=True)
         _health_failures += 1
 
     if not database_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+
+    # Auth being unusable does not make the process unhealthy — health itself stays
+    # open — but every /api/v1 route will 503, so the client must be able to see it.
+    auth_usable = settings.auth_enabled or settings.allow_unauthenticated
 
     return HealthDTO(
         status="ok" if database_ok else "degraded",
@@ -137,6 +153,7 @@ async def health(response: Response) -> HealthDTO:
         storage=settings.storage_backend,
         transcription=settings.transcription_provider,
         llm=settings.llm_provider,
+        auth=auth_usable,
         detail=detail,
     )
 
@@ -154,6 +171,17 @@ def _connection_hint(url: str, exc: Exception) -> str:
                 "is being used — inside a container that is the container itself. Set "
                 "WC_DATABASE_URL (compose normally points it at the 'postgres' service).")
     return base
+
+
+def _schema_missing(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return ("no such table" in message or "undefinedtable" in message
+            or ("relation" in message and "does not exist" in message))
+
+
+def _schema_hint() -> str:
+    return ("the database is reachable but has no schema: the tasks table is missing. "
+            "Run `alembic upgrade head` (or set WC_RUN_MIGRATIONS=1).")
 
 
 def _host_of(url: str) -> str:
@@ -179,6 +207,30 @@ async def health_alias(response: Response) -> HealthDTO:
 async def http_exception(_request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code,
                         content={"error": _code(exc.status_code), "detail": exc.detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception(_request, exc: RequestValidationError) -> JSONResponse:
+    # FastAPI's default body is {"detail": [ ... ]}, which the Mac's error decoder
+    # cannot read (it expects a string). Flatten it to the same shape as every other
+    # error, and keep the per-field list for debugging.
+    errors = _json_safe(jsonable_encoder(exc.errors()))
+    first = errors[0] if errors else {}
+    location = ".".join(str(part) for part in first.get("loc", []) if part != "body")
+    message = str(first.get("msg") or "invalid request")
+    detail = f"{location}: {message}" if location else message
+    return JSONResponse(status_code=422, content={"error": "unprocessable",
+                                                  "detail": detail, "errors": errors})
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _code(status: int) -> str:

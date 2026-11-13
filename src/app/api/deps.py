@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import hmac
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException, status
@@ -15,13 +16,20 @@ from ..services.errors import ServiceError
 
 
 async def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
-    """Bearer auth. Disabled only when no token is configured, which is intended for
-    a machine reachable solely over a private tunnel."""
+    """Bearer auth.
+
+    Fails closed. An unset token used to disable authentication entirely, which meant
+    one missed environment variable published the whole API; now it returns 503 unless
+    the operator has explicitly opted out with WC_ALLOW_UNAUTHENTICATED.
+    """
     settings = get_settings()
     if not settings.auth_enabled:
-        return
+        if settings.allow_unauthenticated:
+            return
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "WC_API_TOKEN is not configured; refusing unauthenticated requests")
     expected = f"Bearer {settings.api_token}"
-    if authorization != expected:
+    if not hmac.compare_digest((authorization or "").encode(), expected.encode()):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or missing bearer token")
 
 

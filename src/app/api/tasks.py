@@ -22,7 +22,7 @@ async def list_tasks(
     meetingId: str | None = None,
     includeArchived: bool = False,
     includeDone: bool = True,
-    limit: int | None = None,
+    limit: int | None = Query(default=None, ge=0, le=10_000),
 ) -> list[TaskDTO]:
     try:
         tasks = await TaskService(session).list(
@@ -61,7 +61,9 @@ async def patch_task(task_id: str, body: PatchTaskBody, session: SessionDep) -> 
 @router.delete("/{task_id}", response_model=TaskDTO)
 async def delete_task(task_id: str, session: SessionDep, hard: bool = False) -> TaskDTO:
     try:
-        return to_dto(await TaskService(session).delete(task_id, hard=hard))
+        # The service snapshots the row before deleting it; serialising the deleted
+        # instance afterwards is what used to happen here.
+        return await TaskService(session).delete(task_id, hard=hard)
     except ServiceError as error:
         raise http_error(error) from error
 

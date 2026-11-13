@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 
 from ..db.models import MeetingStatus
 from ..services.errors import Invalid, ServiceError
@@ -17,10 +17,36 @@ router = APIRouter(prefix="/meetings", tags=["meetings"], dependencies=[Authenti
 # 4 hours of 64 kbps mono AAC is roughly 115 MB; anything larger is a mistake.
 MAX_AUDIO_BYTES = 512 * 1024 * 1024
 
+# The client writes AAC/MP4. Sniffing the first bytes stops an arbitrary payload from
+# being handed to ffmpeg by the worker, even if its Content-Type claims audio.
+_AUDIO_MAGIC: dict[str, tuple[int, bytes]] = {
+    "audio/mp4": (4, b"ftyp"),
+    "audio/x-m4a": (4, b"ftyp"),
+    "audio/m4a": (4, b"ftyp"),
+    "audio/wav": (0, b"RIFF"),
+    "audio/x-wav": (0, b"RIFF"),
+    "audio/mpeg": (0, b"ID3"),
+    "audio/ogg": (0, b"OggS"),
+    "audio/webm": (0, b"\x1aE\xdf\xa3"),
+}
+
+
+def _is_audio(content_type: str, head: bytes) -> bool:
+    base = content_type.split(";", 1)[0].strip().lower()
+    # MPEG audio and ADTS AAC start with a frame sync rather than a container header.
+    if base in ("audio/mpeg", "audio/mp3", "audio/aac"):
+        return head[:3] == b"ID3" or (len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)
+    signature = _AUDIO_MAGIC.get(base)
+    if signature is None:
+        return False
+    offset, magic = signature
+    return head[offset:offset + len(magic)] == magic
+
 
 @router.get("", response_model=list[MeetingDTO])
 async def list_meetings(session: SessionDep, storage: StorageDep,
-                        limit: int = 100, q: str | None = None) -> list[MeetingDTO]:
+                        limit: int = Query(default=100, ge=1, le=1000),
+                        q: str | None = None) -> list[MeetingDTO]:
     service = MeetingService(session, storage)
     meetings = await service.list(limit=limit, query=q)
     return [meeting_dto(m) for m in meetings]
@@ -71,20 +97,45 @@ async def upload_audio(meeting_id: str, request: Request, session: SessionDep,
     The body is read in chunks rather than buffered, so a long meeting does not have
     to fit in the API process's memory.
     """
-    content_type = request.headers.get("content-type", "audio/mp4")
-    declared = int(request.headers.get("content-length") or 0)
+    content_type = (request.headers.get("content-type", "audio/mp4").split(";", 1)[0].strip()
+                    or "audio/mp4")[:100]
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        raise http_error(Invalid("invalid Content-Length header")) from None
     if declared > MAX_AUDIO_BYTES:
         raise http_error(Invalid(f"recording is too large ({declared} bytes)"))
 
     total = 0
+    checked = False
 
     async def stream():
-        nonlocal total
+        nonlocal total, checked
+        pending: list[bytes] = []
         async for chunk in request.stream():
+            if not chunk:
+                continue
             total += len(chunk)
             if total > MAX_AUDIO_BYTES:
                 raise Invalid("recording exceeded the maximum size")
-            yield chunk
+            if checked:
+                yield chunk
+                continue
+            pending.append(chunk)
+            head = b"".join(pending)
+            if len(head) < 16:
+                continue
+            if not _is_audio(content_type, head):
+                raise Invalid(f"unsupported or unrecognised audio format ({content_type})")
+            checked = True
+            for buffered in pending:
+                yield buffered
+            pending.clear()
+        if pending:
+            if not _is_audio(content_type, b"".join(pending)):
+                raise Invalid(f"unsupported or unrecognised audio format ({content_type})")
+            for buffered in pending:
+                yield buffered
 
     try:
         meeting = await MeetingService(session, storage).store_audio(meeting_id, stream(), content_type)
@@ -104,7 +155,8 @@ async def process_meeting(meeting_id: str, session: SessionDep, storage: Storage
     """
     service = MeetingService(session, storage)
     try:
-        meeting = await service.get(meeting_id)
+        # Row-locked so two concurrent PROCESS calls cannot both enqueue a job.
+        meeting = await service.lock(meeting_id)
         if not meeting.audio_key:
             raise Invalid("no audio has been uploaded for this meeting")
 
