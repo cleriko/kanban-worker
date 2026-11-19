@@ -3,9 +3,10 @@ from __future__ import annotations
 import logging
 
 from fastapi import APIRouter, Query, Request, Response, status
+from fastapi.responses import FileResponse
 
 from ..db.models import MeetingStatus
-from ..services.errors import Invalid, ServiceError
+from ..services.errors import Invalid, NotFound, ServiceError
 from ..services.meeting_service import MeetingService, action_item_dto, meeting_dto
 from .deps import Authenticated, QueueDep, SessionDep, StorageDep, http_error
 from .schemas import ActionItemDTO, CreateMeetingBody, JobDTO, MeetingDTO, TranscriptDTO
@@ -142,6 +143,25 @@ async def upload_audio(meeting_id: str, request: Request, session: SessionDep,
     except ServiceError as error:
         raise http_error(error) from error
     return meeting_dto(meeting)
+
+
+@router.get("/{meeting_id}/audio")
+async def get_audio(meeting_id: str, session: SessionDep, storage: StorageDep) -> FileResponse:
+    """Serves the stored recording so the client can play it back inline."""
+    try:
+        meeting = await MeetingService(session, storage).get(meeting_id)
+        if not meeting.audio_key:
+            raise NotFound(f"no audio for meeting {meeting_id}")
+        path = await storage.get_path(meeting.audio_key)
+    except FileNotFoundError as error:
+        raise http_error(NotFound(f"no audio for meeting {meeting_id}")) from error
+    except ServiceError as error:
+        raise http_error(error) from error
+    return FileResponse(
+        path,
+        media_type=meeting.audio_content_type or "audio/mp4",
+        headers={"Content-Disposition": "inline", "Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.post("/{meeting_id}/process", response_model=JobDTO,
